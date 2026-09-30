@@ -28,6 +28,21 @@ function sanitize(raw: unknown): InputEvent | null {
       const seq = num(e.seq, 0, 2 ** 31);
       return x === null || y === null ? null : { type: "wheel", x, y, dx, dy, ...(seq ? { seq: Math.floor(seq) } : {}) };
     }
+    case "touch": {
+      if (e.phase !== "start" && e.phase !== "move" && e.phase !== "end" && e.phase !== "cancel") return null;
+      if (!Array.isArray(e.points) || e.points.length > 2 || ((e.phase === "start" || e.phase === "move") && e.points.length === 0)) return null;
+      const points = e.points.flatMap((rawPoint, index) => {
+        if (!rawPoint || typeof rawPoint !== "object") return [];
+        const point = rawPoint as Record<string, unknown>;
+        const px = num(point.x, 0, 4000);
+        const py = num(point.y, 0, 4000);
+        if (px === null || py === null) return [];
+        return [{ id: Math.floor(num(point.id, 0, 32) ?? index), x: px, y: py }];
+      });
+      if (points.length !== e.points.length) return null;
+      const seq = num(e.seq, 0, 2 ** 31);
+      return { type: "touch", phase: e.phase, points, ...(seq ? { seq: Math.floor(seq) } : {}) };
+    }
     case "press":
       return typeof e.key === "string" && e.key.length > 0 && e.key.length <= 40 ? { type: "press", key: e.key } : null;
     case "text":

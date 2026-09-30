@@ -112,6 +112,7 @@ export default function HomePage() {
   const [targetLang, setTargetLang] = useState("zh-CN");
   const [hiddenBar, setHiddenBar] = useState<string | null>(null);
   const addressRef = useRef<HTMLInputElement>(null);
+  const keyboardFocusRef = useRef<(() => void) | null>(null);
 
   const activeTab = useMemo(() => tabs.find((tab) => tab.id === activeId) ?? null, [tabs, activeId]);
   const isHome = !activeTab || isBlank(activeTab.url);
@@ -420,6 +421,7 @@ export default function HomePage() {
           <button type="button" className="address-star" aria-label="在真实窗口打开" title="在真实窗口打开" onClick={openExternally}><Icon name="external" size={16} /></button>
         </form>
         <div className="toolbar-right">
+          <button type="button" className="toolbar-button mobile-keyboard-button" aria-label="打开远程网页键盘" title="打开远程网页键盘" disabled={status !== "ready" || isHome} onClick={() => keyboardFocusRef.current?.()}><Icon name="keyboard" size={18} /></button>
           <span className={`privacy-pill status-${status}`} title={connectionLabel}><Icon name="shield" size={16} /><span>{status === "ready" ? "隔离浏览" : "连接中"}</span></span>
           <div className="menu-wrap">
             <button className="toolbar-button" aria-label="浏览器菜单" onClick={(event) => { event.stopPropagation(); setShowMenu((value) => !value); }}><Icon name="dots" size={19} /></button>
@@ -471,6 +473,7 @@ export default function HomePage() {
           onResize={rb.resize}
           onFrameDrawn={rb.frameDrawn}
           onContextMenu={openContextMenu}
+          keyboardFocusRef={keyboardFocusRef}
           cursor={rb.cursor}
           hidden={isHome}
           focusSignal={focusSignal}

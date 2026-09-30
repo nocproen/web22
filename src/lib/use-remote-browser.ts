@@ -73,6 +73,7 @@ export type ClientInput =
   | { type: "move"; x: number; y: number }
   | { type: "down" | "up"; x: number; y: number; button: "left" | "middle" | "right"; clicks: number }
   | { type: "wheel"; x: number; y: number; dx: number; dy: number; seq?: number }
+  | { type: "touch"; phase: "start" | "move" | "end" | "cancel"; points: { id: number; x: number; y: number }[]; seq?: number }
   | { type: "press"; key: string }
   | { type: "text"; text: string };
 
@@ -81,7 +82,7 @@ export type QueueInfo = { active: number; limit: number; retryAt: number };
 export type Quality = "auto" | "smooth" | "balanced" | "sharp";
 export type Transport = "ws" | "sse" | null;
 
-type SessionState = { tabs: RemoteTab[]; activeId: number | null; viewport: { width: number; height: number }; quality?: Quality; dpr?: number };
+type SessionState = { tabs: RemoteTab[]; activeId: number | null; viewport: { width: number; height: number }; isMobile?: boolean; quality?: Quality; dpr?: number };
 export type StreamStats = { rtt: number | null; fps: number; bw: number | null; q: number | null; scale: number };
 
 const SESSION_KEY = "luma_remote_session";
@@ -116,6 +117,8 @@ export function useRemoteBrowser() {
   const viewportRef = useRef({ width: 1280, height: 800 });
   const pendingRef = useRef<ClientInput[]>([]);
   const flushTimerRef = useRef<number | null>(null);
+  /** Timer ids and rAF handles come from different pools, so remember which one is pending. */
+  const flushIsRafRef = useRef(false);
   const inflightRef = useRef(false);
   const toastIdRef = useRef(0);
   const framesRef = useRef(0);
@@ -159,10 +162,24 @@ export function useRemoteBrowser() {
       setStatus((current) => (current === "ready" ? "reconnecting" : "connecting"));
       while (!cancelled) {
         const stored = sessionStorage.getItem(SESSION_KEY);
+        const content = document.querySelector<HTMLElement>(".browser-content");
+        const bounds = content?.getBoundingClientRect();
+        if (bounds && bounds.width >= 50 && bounds.height >= 50) {
+          viewportRef.current = { width: Math.round(bounds.width), height: Math.round(bounds.height) };
+        } else if (window.innerWidth >= 50 && window.innerHeight >= 50 && viewportRef.current.width === 1280) {
+          viewportRef.current = { width: window.innerWidth, height: Math.max(240, window.innerHeight - 150) };
+        }
+        const mobile = window.matchMedia("(pointer: coarse)").matches || navigator.maxTouchPoints > 0;
+        const ios = /iPhone|iPad|iPod/i.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+        const mobilePlatform = ios ? "ios" : "android";
+        // Phones can report DPR 3 while rendering a small CSS viewport. A 1.5x
+        // remote surface preserves readable text but cuts codec/decode pixels by
+        // ~44% compared with a 2x cap on common Retina phones.
+        const captureDpr = mobile ? Math.min(window.devicePixelRatio || 1, 1.5) : (window.devicePixelRatio || 1);
         const res = await fetch("/api/rb/session", {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ id: stored, reset, dpr: window.devicePixelRatio || 1, ...viewportRef.current }),
+          body: JSON.stringify({ id: stored, reset, mobile, mobilePlatform, dpr: captureDpr, ...viewportRef.current }),
         }).catch(() => null);
         reset = false;
         if (cancelled) return null;
@@ -445,7 +462,8 @@ export function useRemoteBrowser() {
 
   const flush = useCallback(() => {
     if (flushTimerRef.current !== null) {
-      window.clearTimeout(flushTimerRef.current);
+      if (flushIsRafRef.current) window.cancelAnimationFrame(flushTimerRef.current);
+      else window.clearTimeout(flushTimerRef.current);
       flushTimerRef.current = null;
     }
     const socket = wsRef.current;
@@ -462,11 +480,18 @@ export function useRemoteBrowser() {
     const last = queue[queue.length - 1];
     if (event.type === "move" && last?.type === "move") queue[queue.length - 1] = event;
     else if (event.type === "wheel" && last?.type === "wheel") queue[queue.length - 1] = { ...event, dx: last.dx + event.dx, dy: last.dy + event.dy };
+    else if (event.type === "touch" && event.phase === "move" && last?.type === "touch" && last.phase === "move") queue[queue.length - 1] = event;
     else queue.push(event);
 
-    // Clicks and keys go out immediately; moves/wheel are coalesced to ~60 per second.
-    if (event.type !== "move" && event.type !== "wheel") flush();
-    else if (flushTimerRef.current === null) flushTimerRef.current = window.setTimeout(flush, 16);
+    // Clicks, gesture boundaries, and keys go out immediately. High-frequency
+    // motion is coalesced onto the display's refresh cadence.
+    const motion = event.type === "move" || event.type === "wheel" || (event.type === "touch" && event.phase === "move");
+    if (!motion) flush();
+    else if (flushTimerRef.current === null) {
+      const useRaf = typeof window.requestAnimationFrame === "function";
+      flushIsRafRef.current = useRaf;
+      flushTimerRef.current = useRaf ? window.requestAnimationFrame(() => flush()) : window.setTimeout(flush, 16);
+    }
   }, [flush]);
 
   return {

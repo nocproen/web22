@@ -90,15 +90,19 @@ export type SessionState = {
   tabs: TabState[];
   activeId: number | null;
   viewport: Viewport;
+  isMobile: boolean;
 };
 
 /** A source frame from Chromium (device pixels). scrollY is the root scroll offset in CSS px. */
 export type Frame = { tab: number; seq: number; w: number; h: number; data: string; scrollY: number | null; ts: number; inputSeq: number };
 
+export type TouchPoint = { id: number; x: number; y: number };
+
 export type InputEvent =
   | { type: "move"; x: number; y: number }
   | { type: "down" | "up"; x: number; y: number; button: "left" | "middle" | "right"; clicks: number }
   | { type: "wheel"; x: number; y: number; dx: number; dy: number; seq?: number }
+  | { type: "touch"; phase: "start" | "move" | "end" | "cancel"; points: TouchPoint[]; seq?: number }
   | { type: "press"; key: string }
   | { type: "text"; text: string };
 
@@ -198,6 +202,10 @@ const LAUNCH_ARGS = [
   "--no-default-browser-check",
   "--disable-features=Translate,MediaRouter",
   "--autoplay-policy=no-user-gesture-required",
+  // The viewer predicts scrolling locally and moves its canvas instantly. Chrome's
+  // animated wheel scrolling would land the real page a frame or two later, so the
+  // arriving frames keep contradicting the prediction — visible as judder.
+  "--disable-smooth-scrolling",
 ];
 
 function run(command: string, args: string[], timeoutMs: number) {
@@ -341,9 +349,12 @@ export class RemoteSession {
   private wheelSeq = 0;
   private scrollProbing = false;
   private scrollProbeAgain = false;
+  private lastScrollProbeAt = 0;
+  private scrollSettleTimer: NodeJS.Timeout | null = null;
+  private reportedScrollY = -1;
   scrollInfo: { y: number; max: number } = { y: 0, max: -1 };
 
-  private constructor(private context: BrowserContext, public viewport: Viewport, readonly bucket: number) {}
+  private constructor(private context: BrowserContext, public viewport: Viewport, readonly bucket: number, readonly isMobile: boolean) {}
 
   get dpr() {
     return this.bucket;
@@ -360,17 +371,30 @@ export class RemoteSession {
     return seq;
   }
 
-  static async create(browser: Browser, viewport: Viewport, bucket: number) {
+  static async create(browser: Browser, viewport: Viewport, bucket: number, isMobile = false, mobilePlatform: "ios" | "android" = "android") {
     const version = browser.version().split(".")[0] || "150";
+    const userAgent = !isMobile
+      ? `Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${version}.0.0.0 Safari/537.36`
+      : mobilePlatform === "ios"
+        ? "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+        : `Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${version}.0.0.0 Mobile Safari/537.36`;
+    // Cost-safe multi-tenancy: share the Chromium process, NEVER the profile.
+    // One fresh, non-persistent context per remote user isolates cookies, cache,
+    // local/session storage, permissions, and service workers. All tabs created
+    // below intentionally live in this one user's context so their own login
+    // persists across tabs for the lifetime of this remote session.
     const context = await browser.newContext({
       viewport,
       deviceScaleFactor: bucket,
+      isMobile,
+      hasTouch: isMobile,
       locale: "zh-CN",
-      userAgent: `Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${version}.0.0.0 Safari/537.36`,
+      userAgent,
       acceptDownloads: false,
       serviceWorkers: "allow",
+      storageState: { cookies: [], origins: [] },
     });
-    const session = new RemoteSession(context, viewport, bucket);
+    const session = new RemoteSession(context, viewport, bucket, isMobile);
     await context.addInitScript({ content: PAGE_RUNTIME });
     await context.exposeBinding("__lumaNotify", (source) => session.onPageNotify(source.page));
     context.on("page", (page) => {
@@ -406,6 +430,10 @@ export class RemoteSession {
       this.emit("closed", { reason, message });
     }
     this.listeners.clear();
+    if (this.scrollSettleTimer) clearTimeout(this.scrollSettleTimer);
+    this.scrollSettleTimer = null;
+    if (this.stateTimer) clearTimeout(this.stateTimer);
+    this.stateTimer = null;
     await this.context.close().catch(() => {});
   }
 
@@ -444,6 +472,7 @@ export class RemoteSession {
     return {
       activeId: this.activeId,
       viewport: this.viewport,
+      isMobile: this.isMobile,
       quality: this.quality,
       dpr: this.bucket,
       tabs: this.order
@@ -615,6 +644,7 @@ export class RemoteSession {
   }
 
   private pushFrame(tabId: number, data: string, scrollY: number | null, ts: number) {
+    const inputSeq = this.wheelSeqBefore(ts);
     const frame: Frame = {
       tab: tabId,
       seq: ++this.seq,
@@ -623,8 +653,19 @@ export class RemoteSession {
       data,
       scrollY,
       ts,
-      inputSeq: this.wheelSeqBefore(ts),
+      inputSeq,
     };
+    // Every screencast frame already carries the root scroll offset, so the
+    // authoritative position is free. Polling the page for it (one evaluate per
+    // wheel) used to run ~60 tasks/s on the very main thread that has to lay out
+    // and paint the scroll, which is exactly what made fast scrolling stutter.
+    if (scrollY !== null) {
+      this.scrollInfo = { y: scrollY, max: this.scrollInfo.max };
+      if (Math.abs(scrollY - this.reportedScrollY) >= 1) {
+        this.reportedScrollY = scrollY;
+        this.emit("scroll", { seq: inputSeq, y: scrollY, max: this.scrollInfo.max });
+      }
+    }
     this.lastFrame = frame;
     this.emit("frame", frame);
   }
@@ -761,25 +802,34 @@ export class RemoteSession {
       let lastPoint: { x: number; y: number } | null = null;
       let copied: string | undefined;
       let wheeled = false;
+      // Wheel packets are fire-and-forget: CDP keeps ordering on a single
+      // session, so waiting for each round trip only added latency between the
+      // events of one burst. Anything order-sensitive drains them first.
+      let wheelPipe: Promise<unknown> = Promise.resolve();
+      const drain = () => wheelPipe.catch(() => {});
 
       for (const event of events) {
         try {
           switch (event.type) {
             case "move":
+              await drain();
               await this.dispatchMouse(tab, "mouseMoved", event.x, event.y);
               lastPoint = event;
               break;
             case "down":
+              await drain();
               this.pressed = event.button;
               await this.dispatchMouse(tab, "mousePressed", event.x, event.y, event.clicks);
               break;
             case "up":
+              await drain();
               if (!this.pressed) this.pressed = event.button;
               await this.dispatchMouse(tab, "mouseReleased", event.x, event.y, event.clicks);
               this.pressed = null;
               break;
             case "wheel":
-              await tab.cdp.send("Input.dispatchMouseEvent", { type: "mouseWheel", x: event.x, y: event.y, deltaX: event.dx, deltaY: event.dy });
+              wheelPipe = tab.cdp.send("Input.dispatchMouseEvent", { type: "mouseWheel", x: event.x, y: event.y, deltaX: event.dx, deltaY: event.dy });
+              wheelPipe.catch(() => {});
               if (event.seq) {
                 this.wheelSeq = event.seq;
                 this.wheelLog.push({ seq: event.seq, at: Date.now() });
@@ -787,11 +837,31 @@ export class RemoteSession {
                 wheeled = true;
               }
               break;
+            case "touch": {
+              const type = event.phase === "start" ? "touchStart" : event.phase === "move" ? "touchMove" : event.phase === "cancel" ? "touchCancel" : "touchEnd";
+              const touchPoints = event.points.map(({ id, x, y }) => ({ id, x, y, radiusX: 1, radiusY: 1, force: 1 }));
+              if (event.phase === "move") {
+                wheelPipe = tab.cdp.send("Input.dispatchTouchEvent", { type, touchPoints });
+                wheelPipe.catch(() => {});
+              } else {
+                await drain();
+                await tab.cdp.send("Input.dispatchTouchEvent", { type, touchPoints });
+              }
+              if (event.seq) {
+                this.wheelSeq = event.seq;
+                this.wheelLog.push({ seq: event.seq, at: Date.now() });
+                if (this.wheelLog.length > 64) this.wheelLog.shift();
+                wheeled = true;
+              }
+              break;
+            }
             case "press":
+              await drain();
               await tab.page.keyboard.press(event.key);
               if (/^Control\+[cx]$/i.test(event.key)) copied = await this.readSelection(tab);
               break;
             case "text":
+              await drain();
               await tab.cdp.send("Input.insertText", { text: event.text });
               break;
           }
@@ -800,8 +870,9 @@ export class RemoteSession {
         }
       }
 
+      await drain();
       if (lastPoint) this.probeCursor(tab, lastPoint);
-      if (wheeled) this.probeScroll(tab);
+      if (wheeled) this.afterWheel(tab);
       return { copied };
     });
   }
@@ -932,6 +1003,27 @@ export class RemoteSession {
    * Reports the root scroll position/limit so the client can predict scrolling
    * locally (and knows when a wheel did nothing, e.g. at the bottom of a page).
    */
+  /**
+   * Called after a wheel batch. The scroll *position* now comes from screencast
+   * metadata for free, so the page only has to be asked for the scroll *limit*
+   * (scrollHeight), which barely changes. We therefore probe at most ~4x/s while
+   * the wheel is spinning, plus one trailing probe once it stops — this also
+   * covers the case where the root cannot move at all (inner scroller / page
+   * bottom) and no new frame would otherwise be produced.
+   */
+  private afterWheel(tab: Tab) {
+    const now = Date.now();
+    if (now - this.lastScrollProbeAt > 250) {
+      this.lastScrollProbeAt = now;
+      this.probeScroll(tab);
+    }
+    if (this.scrollSettleTimer) clearTimeout(this.scrollSettleTimer);
+    this.scrollSettleTimer = setTimeout(() => {
+      this.scrollSettleTimer = null;
+      if (!this.dead && this.activeId === tab.id) this.probeScroll(tab);
+    }, 140);
+  }
+
   private probeScroll(tab: Tab) {
     if (this.scrollProbing) {
       this.scrollProbeAgain = true;
@@ -948,6 +1040,7 @@ export class RemoteSession {
       .then((info) => {
         if (!info || this.activeId !== tab.id) return;
         this.scrollInfo = info;
+        this.reportedScrollY = info.y;
         this.emit("scroll", { seq, y: info.y, max: info.max });
       })
       .catch(() => {})
@@ -1077,7 +1170,7 @@ function secondsUntilReclaim() {
   return Math.max(3, Math.ceil((oldest + RECLAIM_AFTER_MS - now) / 1000));
 }
 
-export async function createSession(viewport: Partial<Viewport> | undefined, dpr?: unknown) {
+export async function createSession(viewport: Partial<Viewport> | undefined, dpr?: unknown, isMobile = false, mobilePlatform: "ios" | "android" = "android") {
   startSweeper();
   // Free space first, then start the (possibly new) Chromium process.
   let freed = 0;
@@ -1093,7 +1186,7 @@ export async function createSession(viewport: Partial<Viewport> | undefined, dpr
   }
   const bucket = dprBucket(dpr);
   const browser = await ensureEngine(bucket);
-  const session = await RemoteSession.create(browser, clampViewport(viewport), bucket);
+  const session = await RemoteSession.create(browser, clampViewport(viewport), bucket, isMobile, mobilePlatform);
   store.sessions.set(session.id, session);
   return session;
 }

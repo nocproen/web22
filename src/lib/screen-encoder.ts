@@ -26,6 +26,11 @@ const MAX_INFLIGHT = 8;
 const REFINE_DELAY = 320;
 const MOTION_LADDER = [75, 62, 50, 40];
 
+/** Tile verdicts. NOISY = content survived the scroll but carries JPEG grid noise. */
+const DIRTY = 0;
+const CLEAN = 1;
+const NOISY = 2;
+
 type Raw = { buf: Buffer; w: number; h: number; tab: number; scrollY: number | null };
 type Rect = { x: number; y: number; w: number; h: number };
 type Encoded = Rect & { data: Buffer };
@@ -158,9 +163,17 @@ export class ScreenEncoder {
       for (let ty = 0; ty < rows; ty += 1) {
         for (let tx = 0; tx < cols; tx += 1) {
           const index = ty * cols + tx;
-          if (!this.tileClean(raw, ref, tx, ty, dy)) {
+          const verdict = this.tileVerdict(raw, ref, tx, ty, dy);
+          if (verdict === DIRTY) {
             dirty[index] = 1;
-          } else if (this.lowq) {
+            continue;
+          }
+          if (verdict === NOISY) {
+            // Kept as-is this frame; owe the viewer a crisp repaint once motion stops.
+            nextLowq[index] = 1;
+            continue;
+          }
+          if (this.lowq) {
             // The client keeps (shifted) pixels here; carry over their quality state.
             const y0 = ty * TILE + dy;
             const y1 = Math.min(h, ty * TILE + TILE) - 1 + dy;
@@ -180,6 +193,7 @@ export class ScreenEncoder {
       // Nothing visible changed; still adopt the new reference (scroll position etc.).
       this.ref = raw;
       this.lowq = nextLowq;
+      this.scheduleRefine();
       return;
     }
 
@@ -223,13 +237,24 @@ export class ScreenEncoder {
     return { q: 40, s };
   }
 
-  private tileClean(raw: Raw, ref: Raw, tx: number, ty: number, dy: number) {
+  /**
+   * Verdict for one tile against the (dy-shifted) reference.
+   *
+   * Source frames arrive as independently compressed JPEGs, so after a scroll
+   * the block grid lands on different pixels and *identical* text decodes a
+   * little differently. Judging those tiles "dirty" means re-encoding almost
+   * the whole screen on every scroll frame, which is what made scrolling
+   * expensive. Tiles that clearly survived the scroll are therefore accepted
+   * as NOISY: they are not re-sent while the page is moving, and the refine
+   * pass repaints them crisp the moment the screen settles.
+   */
+  private tileVerdict(raw: Raw, ref: Raw, tx: number, ty: number, dy: number) {
     const { w, h } = raw;
     const x0 = tx * TILE;
     const x1 = Math.min(w, x0 + TILE);
     const y0 = ty * TILE;
     const y1 = Math.min(h, y0 + TILE);
-    if (y0 + dy < 0 || y1 - 1 + dy >= h) return false;
+    if (y0 + dy < 0 || y1 - 1 + dy >= h) return DIRTY;
     const rowBytes = (x1 - x0) * 3;
     let exact = true;
     for (let y = y0; y < y1; y += 1) {
@@ -240,13 +265,14 @@ export class ScreenEncoder {
         break;
       }
     }
-    if (exact) return true;
-    if (dy === 0) return false;
-    // After a scroll the JPEG block grid moved, so identical content decodes
-    // slightly differently. Accept tiles that match within compression noise.
+    if (exact) return CLEAN;
+    if (dy === 0) return DIRTY;
+
     let max = 0;
     let sum = 0;
     let count = 0;
+    // Bail out early once the tile is clearly real motion, not codec noise.
+    const hardMax = 430;
     for (let y = y0; y < y1; y += 2) {
       const ra = y * w * 3;
       const rb = (y + dy) * w * 3;
@@ -256,13 +282,16 @@ export class ScreenEncoder {
         const d = Math.abs(raw.buf[ia] - ref.buf[ib]) + Math.abs(raw.buf[ia + 1] - ref.buf[ib + 1]) + Math.abs(raw.buf[ia + 2] - ref.buf[ib + 2]);
         if (d > max) {
           max = d;
-          if (max > 120) return false;
+          if (max > hardMax) return DIRTY;
         }
         sum += d;
         count += 1;
       }
     }
-    return sum / count <= 10;
+    const avg = sum / count;
+    if (avg <= 10 && max <= 120) return CLEAN; // indistinguishable; no repaint owed
+    // Survived the scroll but visibly re-compressed: keep it, refine on settle.
+    return avg <= 26 ? NOISY : DIRTY;
   }
 
   private async encodeRects(raw: Raw, rects: Rect[], q: number, s: number): Promise<Encoded[]> {

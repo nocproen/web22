@@ -17,6 +17,20 @@ export const CLOSE_SESSION_ENDED = 4410;
 /** A viewer that hasn't answered a heartbeat for this long is gone (closed tab behind a proxy). */
 const DEAD_AFTER_MS = 15_000;
 
+/** Browser WebSockets carry an Origin. Reject cross-site sockets to prevent
+ * cross-site WebSocket hijacking if a user ever leaks their bearer session id. */
+function sameOriginHost(req: http.IncomingMessage) {
+  const origin = req.headers.origin;
+  if (origin === undefined) return true; // trusted non-browser/health clients
+  if (typeof origin !== "string" || !req.headers.host) return false;
+  try {
+    const parsed = new URL(origin);
+    return (parsed.protocol === "http:" || parsed.protocol === "https:") && parsed.host.toLowerCase() === req.headers.host.toLowerCase();
+  } catch {
+    return false;
+  }
+}
+
 function handleConnection(ws: WebSocket, req: http.IncomingMessage) {
   const url = new URL(req.url ?? "/", "http://localhost");
   const session = getSession(url.searchParams.get("session"));
@@ -134,6 +148,11 @@ export function installWsGateway() {
       const [req, socket, head] = args as [http.IncomingMessage, Duplex, Buffer];
       const pathname = (req.url ?? "").split("?")[0];
       if (pathname === PATH) {
+        if (!sameOriginHost(req)) {
+          socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+          socket.destroy();
+          return true;
+        }
         wss.handleUpgrade(req, socket, head, (ws) => handleConnection(ws, req));
         return true;
       }

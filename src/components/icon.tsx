@@ -22,7 +22,8 @@ export type IconName =
   | "grid"
   | "translate"
   | "image"
-  | "link";
+  | "link"
+  | "keyboard";
 
 export function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
   const common = {
@@ -86,5 +87,7 @@ export function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
       return <svg {...common}><path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1" /><path d="M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1" /></svg>;
     case "grid":
       return <svg {...common}><rect x="4" y="4" width="6" height="6" rx="1" /><rect x="14" y="4" width="6" height="6" rx="1" /><rect x="4" y="14" width="6" height="6" rx="1" /><rect x="14" y="14" width="6" height="6" rx="1" /></svg>;
+    case "keyboard":
+      return <svg {...common}><rect x="3" y="5.5" width="18" height="13" rx="2" /><path d="M7 9h.01M10 9h.01M13 9h.01M16 9h.01M7 12h.01M10 12h.01M13 12h.01M16 12h.01M9 15h6" /></svg>;
   }
 }

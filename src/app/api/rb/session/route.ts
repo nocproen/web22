@@ -6,11 +6,15 @@ export const runtime = "nodejs";
 
 /** Reuse an existing session or create a new one. Returns 202 while the engine is still preparing. */
 export async function POST(request: NextRequest) {
-  const body = (await request.json().catch(() => ({}))) as { id?: string; width?: number; height?: number; dpr?: number; reset?: boolean };
+  const body = (await request.json().catch(() => ({}))) as { id?: string; width?: number; height?: number; dpr?: number; mobile?: boolean; mobilePlatform?: "ios" | "android"; reset?: boolean };
+  const mobile = body.mobile === true;
+  const mobilePlatform = body.mobilePlatform === "ios" ? "ios" : "android";
 
   if (body.reset && body.id) await closeSession(body.id);
   const existing = body.reset ? null : getSession(body.id);
-  if (existing) return NextResponse.json({ id: existing.id, state: existing.getState() });
+  if (existing && existing.isMobile === mobile) return NextResponse.json({ id: existing.id, state: existing.getState() });
+  // A saved desktop session must not silently force a phone into desktop UA/layout.
+  if (existing) await closeSession(existing.id);
 
   const status = engineStatus();
   if (status.status !== "ready") {
@@ -21,7 +25,7 @@ export async function POST(request: NextRequest) {
   }
 
   try {
-    const session = await createSession({ width: body.width, height: body.height }, body.dpr);
+    const session = await createSession({ width: body.width, height: body.height }, body.dpr, mobile, mobilePlatform);
     return NextResponse.json({ id: session.id, state: session.getState() });
   } catch (error) {
     if (error instanceof BusyError) {
